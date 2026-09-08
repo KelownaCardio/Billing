@@ -186,9 +186,9 @@ function inferCare(ward, attending) {
 function handleMediteachPhoto(inp) {
   var file = inp.files[0]; if (!file) return;
   inp.value = '';
-  var reader = new FileReader();
-  reader.onload = function(e) {
-    openCropModal(e.target.result, 'meditech', function(croppedDataUrl) {
+  // v5.14: intake downscale (see photoFileToDataUrl in 09_patient.js).
+  photoFileToDataUrl(file, function(dataUrl) {
+    openCropModal(dataUrl, 'meditech', function(croppedDataUrl) {
       var status = document.getElementById('mit-status');
       status.style.display  = 'block';
       status.className      = 'ocr-bar ocr-ok';
@@ -199,8 +199,7 @@ function handleMediteachPhoto(inp) {
       showModal('mit-modal');
       extractMediteachAI(croppedDataUrl);
     }, function() { /* cancelled — do nothing */ });
-  };
-  reader.readAsDataURL(file);
+  });
 }
 
 async function extractMediteachAI(dataUrl) {

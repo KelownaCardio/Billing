@@ -2225,6 +2225,100 @@ function resetPhotoZone() {
 var _cropPending = null;
 var _cropState = null;
 
+// ═══════════════════════════════════════════════════════════════════
+// v5.14 — PHOTO INTAKE DOWNSCALE  (Android low-memory tab crash)
+// ───────────────────────────────────────────────────────────────────
+// WHY: the Android user's app "kicked back to a blank rounds list" the
+// instant the camera shutter fired, with Chrome's own banner underneath:
+// "Unable to complete previous operation due to low memory". That banner
+// is Chrome reporting that it KILLED the renderer and reloaded the page —
+// the reload lands on the default pane (Rounds), blank until the sync
+// returns. The app never closed; it died and came back.
+//
+// The cause was the intake pipeline, which held several full-resolution
+// copies of a phone photo alive at the same time. On a 50MP Samsung
+// (8160x6120):
+//   1. FileReader.readAsDataURL   ~26 MB base64 string (UTF-16 in heap)
+//   2. crop modal <img>           ~200 MB decoded bitmap
+//   3. cropUse() canvas           ~130 MB at natural crop size
+//   4. processStickerOCR()        decodes the crop AGAIN before resizing
+// The 1200px downscale — the one thing that made the payload small — ran
+// LAST, after peak. Peak was 400-600 MB and Android kills the tab.
+// The gallery path survived because a picked image is often an already
+// resized copy, so it slipped under the limit. Same code, luckier input.
+//
+// FIX: downscale ONCE, at intake, before anything else touches the image.
+// createImageBitmap(file, {resizeWidth}) decodes and resizes in the
+// browser's own image pipeline and never materialises the full bitmap on
+// the JS heap. Everything downstream then works on a <=2400px image.
+// Peak drops from ~500 MB to ~90 MB transient.
+//
+// 3000px is deliberate, not arbitrary. The final OCR payload is capped at
+// 1200px on the crop's longest side, and the crop modal tells the doctor to
+// fit the frame to just the sticker (~40-60% of the photo). At 3000, even a
+// tight 40% crop still yields 1200px — exactly the cap — so the image the
+// OCR sees is bit-for-bit as good as before for every realistic crop.
+// Going lower (2400 was tried) would start to shave tight crops below the
+// cap; going higher buys nothing the cap can use and costs memory back.
+//
+// Every photo entry point in the app routes through here: sticker camera
+// and gallery, clipboard paste, Meditech list import, private-pay
+// demographics, and phone-advice screenshots.
+var PHOTO_INTAKE_MAX = 3000;
+
+// Turn a File/Blob (camera, gallery, clipboard) into a downscaled JPEG
+// data URL. Falls back to a plain read if createImageBitmap is missing or
+// throws — that path is exactly the old behaviour, so an unsupported
+// browser is no worse off than before, never broken.
+function photoFileToDataUrl(file, onReady, onError) {
+  if (!file) { if (onError) onError('no file'); return; }
+
+  function fallbackRead(why) {
+    if (why) console.warn('[photo] intake downscale unavailable (' + why + ') — reading full size');
+    var r = new FileReader();
+    r.onerror = function() { if (onError) onError('read failed'); };
+    r.onload  = function(e) { onReady(String(e.target.result || '')); };
+    r.readAsDataURL(file);
+  }
+
+  if (typeof createImageBitmap !== 'function') { fallbackRead('no createImageBitmap'); return; }
+
+  var promise;
+  try {
+    promise = createImageBitmap(file, { resizeWidth: PHOTO_INTAKE_MAX, resizeQuality: 'high' });
+  } catch (e) { fallbackRead(e && e.message); return; }
+  if (!promise || typeof promise.then !== 'function') { fallbackRead('no promise'); return; }
+
+  promise.then(function(bmp) {
+    // A portrait photo comes back 2400 WIDE (resizeWidth preserves aspect),
+    // so its height can still be ~3200. Cap the long side here too. If a UA
+    // ignored resizeWidth entirely, this same maths still saves us.
+    var w = bmp.width, h = bmp.height;
+    if (w > PHOTO_INTAKE_MAX || h > PHOTO_INTAKE_MAX) {
+      if (w >= h) { h = Math.round(h * PHOTO_INTAKE_MAX / w); w = PHOTO_INTAKE_MAX; }
+      else        { w = Math.round(w * PHOTO_INTAKE_MAX / h); h = PHOTO_INTAKE_MAX; }
+    }
+    var canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    try { bmp.close(); } catch (e) {}          // release immediately, don't wait for GC
+    var url = canvas.toDataURL('image/jpeg', 0.92);
+    canvas.width = canvas.height = 0;          // drop the backing store now
+    onReady(url);
+  })['catch'](function(err) {
+    fallbackRead((err && err.message) || 'decode failed');
+  });
+}
+
+// Free the crop modal's decoded bitmap. A 2400px <img> left with its src
+// set keeps ~30 MB alive for as long as the element exists, and the modal
+// is reused for every photo of the session.
+function releaseCropImage() {
+  var img = document.getElementById('crop-img');
+  if (img) img.removeAttribute('src');
+}
+
+
 // ── OCR background retry state ─────────────────────────────────────
 // Generation counter: each new photo bumps it. The background retry loop
 // checks its own generation against the current one — if they differ
@@ -2302,12 +2396,8 @@ function handleClipboardPaste(e) {
     return true;
   }
 
-  var reader = new FileReader();
-  reader.onerror = function() {
-    if (bar) { bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read pasted image'; }
-  };
-  reader.onload = function(ev) {
-    var dataUrl = ev.target.result || '';
+  // v5.14: same intake downscale as the camera path.
+  photoFileToDataUrl(file, function(dataUrl) {
     // Show preview immediately in photo zone without crop (desktop screenshots
     // are usually already well-framed — but open crop modal so user can trim if needed)
     openCropModal(dataUrl, 'sticker', function(croppedDataUrl) {
@@ -2316,8 +2406,9 @@ function handleClipboardPaste(e) {
       if (bar) { bar.style.display = 'none'; bar.textContent = ''; }
       resetPhotoZone();
     });
-  };
-  reader.readAsDataURL(file);
+  }, function() {
+    if (bar) { bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read pasted image'; }
+  });
   return true;
 }
 
@@ -2359,12 +2450,9 @@ function handleStickerPhoto(inp) {
     bar.textContent = 'Reading photo…';
   }
 
-  var reader = new FileReader();
-  reader.onerror = function() {
-    if (bar) { bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read photo file'; }
-  };
-  reader.onload = function(e) {
-    var dataUrl = e.target.result || '';
+  // v5.14: downscale at intake — a full-res camera file used to kill the
+  // Android renderer here, which reloaded the app to a blank rounds list.
+  photoFileToDataUrl(file, function(dataUrl) {
     openCropModal(dataUrl, 'sticker', function(croppedDataUrl) {
       processStickerOCR(croppedDataUrl, bar);
     }, function() {
@@ -2373,8 +2461,9 @@ function handleStickerPhoto(inp) {
       var pz = document.getElementById('photo-zone');
       if (pz) resetPhotoZone();
     });
-  };
-  reader.readAsDataURL(file);
+  }, function() {
+    if (bar) { bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read photo file'; }
+  });
 }
 
 function processStickerOCR(croppedDataUrl, bar) {
@@ -2412,6 +2501,7 @@ function processStickerOCR(croppedDataUrl, bar) {
     var ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0, w, h);
     var jpegDataUrl = canvas.toDataURL('image/jpeg', 0.75);
+    canvas.width = canvas.height = 0;        // v5.14: release the OCR canvas
     var b64 = jpegDataUrl.split(',')[1];
     // Cache for retry button — allows re-attempt without re-photographing.
     window._lastOCRPayload = { b64: b64, mediaType: 'image/jpeg' };
@@ -3010,6 +3100,7 @@ function cropReset() {
 function cropCancel() {
   var ov = document.getElementById('crop-overlay');
   if (ov) ov.classList.remove('on');
+  releaseCropImage();                        // v5.14: drop the decoded bitmap
   var p = _cropPending;
   _cropPending = null; _cropState = null;
   if (p && p.onCancel) p.onCancel();
@@ -3033,9 +3124,11 @@ function cropUse() {
   var ctx = canvas.getContext('2d');
   ctx.drawImage(img, nx1, ny1, cw, ch, 0, 0, cw, ch);
   var croppedDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+  canvas.width = canvas.height = 0;          // v5.14: release the crop canvas
 
   var ov = document.getElementById('crop-overlay');
   if (ov) ov.classList.remove('on');
+  releaseCropImage();                        // v5.14: drop the decoded bitmap
   var p = _cropPending;
   _cropPending = null; _cropState = null;
   if (p && p.onUse) p.onUse(croppedDataUrl);

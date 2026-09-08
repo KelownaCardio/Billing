@@ -373,11 +373,8 @@ function paPhoto(inp) {
   if (!file) return;
   inp.value = '';
   var bar = document.getElementById('pa-ocr-bar');
-  var reader = new FileReader();
-  reader.onerror = function() {
-    if (bar) { bar.style.display = 'block'; bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read the image file'; }
-  };
-  reader.onload = function(e) {
+  // v5.14: intake downscale (see photoFileToDataUrl in 09_patient.js).
+  photoFileToDataUrl(file, function(dataUrl) {
     var img = new Image();
     img.onerror = function() {
       if (bar) { bar.style.display = 'block'; bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not decode the image'; }
@@ -392,12 +389,14 @@ function paPhoto(inp) {
       canvas.width = w; canvas.height = h;
       canvas.getContext('2d').drawImage(img, 0, 0, w, h);
       var b64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+      canvas.width = canvas.height = 0;      // v5.14: release the canvas
       window._paLastB64 = b64;
       paRunOCR(b64, bar);
     };
-    img.src = e.target.result || '';
-  };
-  reader.readAsDataURL(file);
+    img.src = dataUrl || '';
+  }, function() {
+    if (bar) { bar.style.display = 'block'; bar.className = 'ocr-bar ocr-warn'; bar.textContent = 'Could not read the image file'; }
+  });
 }
 
 function paRunOCR(b64, bar) {

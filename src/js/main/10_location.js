@@ -989,9 +989,9 @@ function ppDemogPhoto(input) {
   var file = input.files && input.files[0];
   input.value = '';
   if (!file) return;
-  var r = new FileReader();
-  r.onload = function(ev) { _ppReadShot(String(ev.target.result || '')); };
-  r.readAsDataURL(file);
+  // v5.14: intake downscale — a monitor photo off a phone camera is the
+  // biggest file the app ever takes in.
+  photoFileToDataUrl(file, function(dataUrl) { _ppReadShot(String(dataUrl || '')); });
 }
 
 // Paste route (desktop). Scoped to the open discharge modal so it can never
@@ -1010,9 +1010,8 @@ document.addEventListener('paste', function(e) {
   e.preventDefault();
   var file = img.getAsFile();
   if (!file) return;
-  var r = new FileReader();
-  r.onload = function(ev) { _ppReadShot(String(ev.target.result || '')); };
-  r.readAsDataURL(file);
+  // v5.14: intake downscale (see photoFileToDataUrl in 09_patient.js).
+  photoFileToDataUrl(file, function(dataUrl) { _ppReadShot(String(dataUrl || '')); });
 }, true);
 
 // Crop first — a phone photo of a whole monitor is mostly furniture, and

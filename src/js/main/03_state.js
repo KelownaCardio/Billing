@@ -516,8 +516,21 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 // permanent 4xx. netlogWorthRetry now retries http_404 once after a longer,
 // jittered pause (netlogRetryDelay). No cache-format change; BUILD_ID not
 // bumped. Files: 03b_netlog.js, 03_state.js (this file).
-var APP_VERSION = 'v5.13';
-var APP_BUILT   = '2026-09-04';
+//
+// v5.14 (2026-09-08) — PHOTO INTAKE DOWNSCALE. Android user's app reloaded
+// to a blank rounds list the moment the camera shutter fired; Chrome's own
+// "Unable to complete previous operation due to low memory" banner was
+// underneath it. The renderer was being OOM-killed by a full-resolution
+// camera file held in several full-size copies at once (base64 string +
+// crop <img> bitmap + crop canvas + a second decode), because the 1200px
+// downscale ran last. Every photo entry point now downscales to 3000px at
+// intake via createImageBitmap before anything else touches the image.
+// Peak ~500 MB -> ~90 MB. OCR payload and accuracy unchanged. No cache
+// format change; BUILD_ID not bumped. Files: 09_patient.js (helper +
+// sticker camera/gallery/paste), 10_location.js, 13_meditech.js,
+// 13b_phoneadvice.js, 03_state.js (this file).
+var APP_VERSION = 'v5.14';
+var APP_BUILT   = '2026-09-08';
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,
             'color:#1a5fa8;font-weight:600');
