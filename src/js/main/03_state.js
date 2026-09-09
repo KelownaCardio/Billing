@@ -529,7 +529,7 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 // format change; BUILD_ID not bumped. Files: 09_patient.js (helper +
 // sticker camera/gallery/paste), 10_location.js, 13_meditech.js,
 // 13b_phoneadvice.js, 03_state.js (this file).
-var APP_VERSION = 'v5.15';
+var APP_VERSION = 'v5.16';
 var APP_BUILT   = '2026-09-09';
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,

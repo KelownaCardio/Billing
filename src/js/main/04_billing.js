@@ -1185,6 +1185,35 @@ function confirmDupClaim() {
                       a.endTime, a.performingAlias, ov);
   if (made) {
     sv('claims', st.claims);
+    // v5.16 (Kathryn, 2026-09-09) — DERIVE THE CALL-OUT BLOCKS.
+    // This path used to end here, and a second same-day consult billed
+    // through this sheet therefore got NO 1200-series block, ever, at any
+    // tier. The mechanism: submitConsultClaims() builds modifiers only
+    // inside `if (consultRow)`, addClaim returns null on an exact
+    // duplicate (it hands off to this sheet instead), so that whole block
+    // was skipped — and this function never picked the job up. A 20:13
+    // stat-holiday consult would have come out with no premium and the
+    // doctor none the wiser.
+    // Same three calls submitConsultClaims makes, in the same order, so
+    // submit-time and dup-time billing cannot diverge. Consults only —
+    // every other fee code reaches this sheet too and has no blocks.
+    // NOTE the times: startTime is the second service time the doctor just
+    // typed; endTime is whatever the form carried. With no end time the
+    // rebuild derives nothing (it needs both), which is correct — and the
+    // claim editor or Day Timeline is where that gets fixed.
+    if (made.fee === '33010' || made.fee === '33012') {
+      try {
+        rebuildConsultModifiers_(made).forEach(function(mc){
+          if (typeof SHEETS_URL !== 'undefined' && SHEETS_URL) push('saveClaim', mc);
+        });
+        sv('claims', st.claims);
+        ccfppRecomputeAround_(made.alias, made.date);
+      } catch (e) {
+        console.warn('dup-claim modifier rebuild failed', e);
+        showToast('Second ' + a.fee + ' billed — but check its call-out block on the day timeline', 'error');
+        return;
+      }
+    }
     showToast('Second ' + a.fee + ' billed at ' + time + ' with your note');
   }
 }

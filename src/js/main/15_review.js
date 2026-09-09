@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// 15_review.js — PHYSICIAN REVIEW MODE            v5.15 (2026-09-09)
+// 15_review.js — PHYSICIAN REVIEW MODE            v5.16 (2026-09-09)
 // ───────────────────────────────────────────────────────────────────
 // index.html?review=<token> — a doctor's list of billing blockers from the
 // ClaimReview tab (filled nightly by PhysicianReview.gs), presented as one
@@ -625,8 +625,37 @@ function rvMarkEditing(modalId) {
 })();
 
 // ── Resubmit / Send to KB ──────────────────────────────────────────
+// v5.16 (Kathryn, 2026-09-09) — this function had two ways to go silently
+// dead, and she hit both in the first production run.
+//   1. RV.busy was set true, awaited across, and set false on the happy
+//      line only. rvStampDeclined's push() can THROW, and then the flag
+//      stayed true for the life of the page — after which the very first
+//      line here returned, with no toast, on every subsequent tap. A dead
+//      Resubmit is the failure a doctor will never report: they just stop
+//      using the page. It is now cleared in a finally, so no throw
+//      anywhere below can strand it.
+//   2. A card whose row was already closed (a second tap, another device,
+//      a stale tab) got 'nothing matched — reload the page' as a toast and
+//      was left sitting on screen looking unfixed. The page now reloads
+//      its own bundle and re-renders, so the queue corrects itself and the
+//      doctor is never asked to reload anything by hand.
+// Nothing about which rows may be actioned changed — that is the backend's
+// call, and it still is.
 async function rvAct(kind) {
   if (RV.busy) return;
+  try {
+    await rvAct_(kind);
+  } catch (e) {
+    try { console.error('[review] rvAct', e); } catch (eL) {}
+    showToast('Something went wrong there — please try again', 'error');
+  } finally {
+    RV.busy = false;
+    var b = document.getElementById('rv-resubmit'); if (b) b.disabled = false;
+    if (RV.bundle) rvRender();
+  }
+}
+
+async function rvAct_(kind) {
   var card = RV.cards[RV.cur];
   var note = RV.notes[card.key] || '';
   var body = { token: RV.token, issueKeys: card.issueKeys, mdNote: note,
@@ -642,9 +671,8 @@ async function rvAct(kind) {
       // that skip into a visible INFO line. Writing the same marker here
       // means one mechanism for every door — this page, the v5.13
       // consult-submit prompt, or a note typed by hand.
-      RV.busy = true;
+      RV.busy = true;                      // cleared by rvAct's finally
       var stamped = await rvStampDeclined(card);
-      RV.busy = false;
       if (!stamped) {
         showToast('That could not be recorded on the claim just now — please try again', 'error');
         rvRender(); return;
@@ -654,25 +682,33 @@ async function rvAct(kind) {
     body.kind = 'later';
   } else body.kind = 'escalate';
 
-  RV.busy = true;
+  RV.busy = true;                        // cleared by rvAct's finally
   var btn = document.getElementById('rv-resubmit'); if (btn) btn.disabled = true;
   var res = await rvCall('reviewAction', body);
-  RV.busy = false;
   if (!res || !res.ok) {
     showToast((res && res.error) || 'That did not save — please try again', 'warn');
-    rvRender(); return;
+    return;
   }
   if (!res.updated || !res.updated.length) {
-    showToast('Could not close that: ' + ((res.refused || []).join('; ') || 'nothing matched — reload the page'), 'error');
-    rvRender(); return;
+    // Nothing was actionable: the row is already closed, or this tab has
+    // been open long enough to go stale. Re-read the queue rather than
+    // leaving a card on screen that no longer exists — a doctor cannot be
+    // expected to know that "nothing matched" means "you already did it".
+    showToast((res.refused || []).length
+      ? ('Could not close that: ' + res.refused.join('; '))
+      : 'That one is already sorted — refreshing your list', 'warn');
+    RV.busy = false;                     // rvLoad calls rvCall in its own right
+    await rvLoad();
+    return;
   }
   if (res.refused && res.refused.length) showToast('Partly closed — ' + res.refused.join('; '), 'error');
-  else showToast(kind === 'escalate' ? 'Reported to KB' : (kind === 'later' ? 'Noted — it will be back in your email tomorrow' : 'Done — thank you'));
+  else showToast(kind === 'escalate' ? 'Reported to KB'
+               : (kind === 'later' ? 'Noted — it will be back in your email tomorrow'
+                                   : 'Submitted — that one is off your list'));
   if (kind !== 'later') {
     RV.cards.splice(RV.cur, 1);
     if (RV.cur >= RV.cards.length) RV.cur = 0;
   }
-  rvRender();
 }
 
 // Append the decline marker to the consult's notes and save it through the
