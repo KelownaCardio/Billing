@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// 15_review.js — PHYSICIAN REVIEW MODE            v5.12 (2026-09-02)
+// 15_review.js — PHYSICIAN REVIEW MODE            v5.15 (2026-09-09)
 // ───────────────────────────────────────────────────────────────────
 // index.html?review=<token> — a doctor's list of billing blockers from the
 // ClaimReview tab (filled nightly by PhysicianReview.gs), presented as one
@@ -394,6 +394,20 @@ function rvFix(card, p, blockers) {
       + '<button class="rv-pill' + (sel === 'attest' ? ' on' : '') + '" onclick="rvChoose(\'attest\')">' + esc(card.attestLabel || 'It does not apply') + '</button>'
       + '<button class="rv-pill' + (satisfied ? ' on' : '') + '" onclick="rvAddFor(' + RV.cur + ')">' + esc(card.addLabel || 'Add it') + (satisfied ? ' — done' : '') + '</button>'
       + '</div>';
+    // v5.15 (Kathryn, 2026-09-09): an out-of-hours question is really a
+    // question about the TIMES, and the times only make sense next to the
+    // rest of that evening's call-out chain — a CCFPP successor's premium
+    // depends on the consult before it. The pills alone gave the doctor no
+    // way to see that, so the same Day Timeline the overlap card uses is
+    // offered here too. It draws the doctor's WHOLE day, so every consult
+    // in the chain is on one clock. Read-only unless they tap a box.
+    if (card.issueType === 'MISSING_OOH_MODIFIER' && card.serviceDate) {
+      h += '<button class="btn btn-p rv-big" style="margin-top:10px" onclick="rvTapTimeline()">'
+         + 'Open my day timeline to check these times</button>'
+         + '<div class="rv-muted">Shows every consult you billed that day on one clock, '
+         + 'in order. Tap a box to retype its start or finish — call-out charges, units '
+         + 'and CCFPP notes re-derive exactly as they do on your phone.</div>';
+    }
     return h;
   }
   if (card.issueType === 'DOC_TIME_OVERLAP') {
@@ -494,7 +508,30 @@ function rvAddFor(idx) {
     // Re-derive through the same function the timeline's Save uses:
     // rebuilds the 12xx rows, persists, recomputes CCFPP around the day.
     applyConsultTimes_(consult, consult.startTime, consult.endTime);
-    showToast('Call-out premium re-derived from the consult times');
+    // v5.15 (Kathryn, 2026-09-09): the rebuild is allowed to decide that NO
+    // 12xx row is due, and until now the toast claimed success either way —
+    // a false green. Two legitimate reasons it creates nothing:
+    //   • the consult is a CCFPP continuation, so the predecessor's own
+    //     1200-series charge already covers this call-out; and
+    //   • continuing care bills in half hours or the major portion, so the
+    //     first unit needs 15 minutes of face time.
+    // Say which, and leave the card open on the attest pill instead of
+    // showing a premium that is not there.
+    var _made = rvClaims(card.phn, card.serviceDate).some(function(c){ return RV_MOD_FEES[String(c.fee)]; });
+    if (_made) {
+      showToast('Call-out premium re-derived from the consult times');
+    } else {
+      RV.choice[card.key] = '';
+      var _ccfpp = /(^|\|)\s*CCFPP:/i.test(String(consult.notes || ''));
+      var _mins  = rvT2m(consult.endTime) - rvT2m(consult.startTime);
+      if (_mins < 0) _mins += 24 * 60;
+      showToast(_ccfpp
+        ? 'No separate premium is due — this consult continues an earlier call-out '
+          + '(' + _mins + ' min of face time; continuing care starts at 15 min). '
+          + 'Check the timeline, then choose "Not out of hours" if the times are right.'
+        : 'Nothing was added — the times as they stand do not earn a premium. '
+          + 'Check them on the timeline, or choose "Not out of hours".', 'error');
+    }
   }
   rvRender();
 }
