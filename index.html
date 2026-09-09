@@ -2792,7 +2792,7 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 // format change; BUILD_ID not bumped. Files: 09_patient.js (helper +
 // sticker camera/gallery/paste), 10_location.js, 13_meditech.js,
 // 13b_phoneadvice.js, 03_state.js (this file).
-var APP_VERSION = 'v5.15';
+var APP_VERSION = 'v5.16';
 var APP_BUILT   = '2026-09-09';
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,
@@ -5634,6 +5634,35 @@ function confirmDupClaim() {
                       a.endTime, a.performingAlias, ov);
   if (made) {
     sv('claims', st.claims);
+    // v5.16 (Kathryn, 2026-09-09) — DERIVE THE CALL-OUT BLOCKS.
+    // This path used to end here, and a second same-day consult billed
+    // through this sheet therefore got NO 1200-series block, ever, at any
+    // tier. The mechanism: submitConsultClaims() builds modifiers only
+    // inside `if (consultRow)`, addClaim returns null on an exact
+    // duplicate (it hands off to this sheet instead), so that whole block
+    // was skipped — and this function never picked the job up. A 20:13
+    // stat-holiday consult would have come out with no premium and the
+    // doctor none the wiser.
+    // Same three calls submitConsultClaims makes, in the same order, so
+    // submit-time and dup-time billing cannot diverge. Consults only —
+    // every other fee code reaches this sheet too and has no blocks.
+    // NOTE the times: startTime is the second service time the doctor just
+    // typed; endTime is whatever the form carried. With no end time the
+    // rebuild derives nothing (it needs both), which is correct — and the
+    // claim editor or Day Timeline is where that gets fixed.
+    if (made.fee === '33010' || made.fee === '33012') {
+      try {
+        rebuildConsultModifiers_(made).forEach(function(mc){
+          if (typeof SHEETS_URL !== 'undefined' && SHEETS_URL) push('saveClaim', mc);
+        });
+        sv('claims', st.claims);
+        ccfppRecomputeAround_(made.alias, made.date);
+      } catch (e) {
+        console.warn('dup-claim modifier rebuild failed', e);
+        showToast('Second ' + a.fee + ' billed — but check its call-out block on the day timeline', 'error');
+        return;
+      }
+    }
     showToast('Second ' + a.fee + ' billed at ' + time + ' with your note');
   }
 }
@@ -20514,7 +20543,7 @@ function ctxEditBtn(btn) { openPatientEdit(btn.getAttribute("data-pid")); }
 function openSummaryEl(el) { openPatientNotes(el.getAttribute("data-pid") || el.closest("[data-pid]").getAttribute("data-pid")); }
 
 // ═══════════════════════════════════════════════════════════════════
-// 15_review.js — PHYSICIAN REVIEW MODE            v5.15 (2026-09-09)
+// 15_review.js — PHYSICIAN REVIEW MODE            v5.16 (2026-09-09)
 // ───────────────────────────────────────────────────────────────────
 // index.html?review=<token> — a doctor's list of billing blockers from the
 // ClaimReview tab (filled nightly by PhysicianReview.gs), presented as one
@@ -21140,8 +21169,37 @@ function rvMarkEditing(modalId) {
 })();
 
 // ── Resubmit / Send to KB ──────────────────────────────────────────
+// v5.16 (Kathryn, 2026-09-09) — this function had two ways to go silently
+// dead, and she hit both in the first production run.
+//   1. RV.busy was set true, awaited across, and set false on the happy
+//      line only. rvStampDeclined's push() can THROW, and then the flag
+//      stayed true for the life of the page — after which the very first
+//      line here returned, with no toast, on every subsequent tap. A dead
+//      Resubmit is the failure a doctor will never report: they just stop
+//      using the page. It is now cleared in a finally, so no throw
+//      anywhere below can strand it.
+//   2. A card whose row was already closed (a second tap, another device,
+//      a stale tab) got 'nothing matched — reload the page' as a toast and
+//      was left sitting on screen looking unfixed. The page now reloads
+//      its own bundle and re-renders, so the queue corrects itself and the
+//      doctor is never asked to reload anything by hand.
+// Nothing about which rows may be actioned changed — that is the backend's
+// call, and it still is.
 async function rvAct(kind) {
   if (RV.busy) return;
+  try {
+    await rvAct_(kind);
+  } catch (e) {
+    try { console.error('[review] rvAct', e); } catch (eL) {}
+    showToast('Something went wrong there — please try again', 'error');
+  } finally {
+    RV.busy = false;
+    var b = document.getElementById('rv-resubmit'); if (b) b.disabled = false;
+    if (RV.bundle) rvRender();
+  }
+}
+
+async function rvAct_(kind) {
   var card = RV.cards[RV.cur];
   var note = RV.notes[card.key] || '';
   var body = { token: RV.token, issueKeys: card.issueKeys, mdNote: note,
@@ -21157,9 +21215,8 @@ async function rvAct(kind) {
       // that skip into a visible INFO line. Writing the same marker here
       // means one mechanism for every door — this page, the v5.13
       // consult-submit prompt, or a note typed by hand.
-      RV.busy = true;
+      RV.busy = true;                      // cleared by rvAct's finally
       var stamped = await rvStampDeclined(card);
-      RV.busy = false;
       if (!stamped) {
         showToast('That could not be recorded on the claim just now — please try again', 'error');
         rvRender(); return;
@@ -21169,25 +21226,33 @@ async function rvAct(kind) {
     body.kind = 'later';
   } else body.kind = 'escalate';
 
-  RV.busy = true;
+  RV.busy = true;                        // cleared by rvAct's finally
   var btn = document.getElementById('rv-resubmit'); if (btn) btn.disabled = true;
   var res = await rvCall('reviewAction', body);
-  RV.busy = false;
   if (!res || !res.ok) {
     showToast((res && res.error) || 'That did not save — please try again', 'warn');
-    rvRender(); return;
+    return;
   }
   if (!res.updated || !res.updated.length) {
-    showToast('Could not close that: ' + ((res.refused || []).join('; ') || 'nothing matched — reload the page'), 'error');
-    rvRender(); return;
+    // Nothing was actionable: the row is already closed, or this tab has
+    // been open long enough to go stale. Re-read the queue rather than
+    // leaving a card on screen that no longer exists — a doctor cannot be
+    // expected to know that "nothing matched" means "you already did it".
+    showToast((res.refused || []).length
+      ? ('Could not close that: ' + res.refused.join('; '))
+      : 'That one is already sorted — refreshing your list', 'warn');
+    RV.busy = false;                     // rvLoad calls rvCall in its own right
+    await rvLoad();
+    return;
   }
   if (res.refused && res.refused.length) showToast('Partly closed — ' + res.refused.join('; '), 'error');
-  else showToast(kind === 'escalate' ? 'Reported to KB' : (kind === 'later' ? 'Noted — it will be back in your email tomorrow' : 'Done — thank you'));
+  else showToast(kind === 'escalate' ? 'Reported to KB'
+               : (kind === 'later' ? 'Noted — it will be back in your email tomorrow'
+                                   : 'Submitted — that one is off your list'));
   if (kind !== 'later') {
     RV.cards.splice(RV.cur, 1);
     if (RV.cur >= RV.cards.length) RV.cur = 0;
   }
-  rvRender();
 }
 
 // Append the decline marker to the consult's notes and save it through the
@@ -21547,5 +21612,5 @@ function dbgCopyLast() {
 <div id="sync-guard">
   <div class="sync-guard-banner"><span class="sg-spin"></span>Refreshing latest patient data&#8230;</div>
 </div>
-<script>var BUILD_HASH = "b09ec1fbb4b0";</script></body>
+<script>var BUILD_HASH = "99097e78ab30";</script></body>
 </html>
