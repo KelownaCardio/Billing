@@ -559,8 +559,49 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 //     Handover flag stays on tap-timestamp last-write-wins.
 //   Files: 03_state.js, 14_init.js, 06c_patient_summary.js. No cache-format
 //   change; BUILD_ID not bumped.
-var APP_VERSION = 'v5.19';
+// v5.20 (2026-09-10 evening) — RELAY DOOR. Requests go to a Cloudflare Worker
+//   (RELAY_URL, 01_config.js) that reaches the same Apps Script through the
+//   Apps Script API instead of the web-app /exec front door, which the
+//   2026-09-10 probes showed holding/dropping ~6% of requests for 20–45s.
+//   Automatic failover to /exec for 10 min when the relay fails a whole
+//   retry chain; per-device override localStorage 'kgh5:door'. Client Errors
+//   checkpoints are suffixed @relay / @exec. Requires Router v3.22
+//   (relayEntry) on an API-executable deployment + the kgh-relay Worker.
+//   Files: 01_config.js, 03_state.js, 03b_netlog.js.
+var APP_VERSION = 'v5.20';
 var APP_BUILT   = '2026-09-10';
+
+// ─── v5.20: door failover ───────────────────────────────────────────
+// Called when a whole retry chain failed on transport (not on a server
+// answer). On the relay → switch to /exec for DOOR_FAILBACK_MS. On /exec
+// (already the fallback, or the doctor's override) → nothing to do.
+// Returns true when it switched doors — the caller then retries the same
+// request on /exec at once instead of showing the doctor an error.
+function _doorFailover(where) {
+  try {
+    if (typeof RELAY_URL === 'undefined' || !RELAY_URL) return false;
+    if (SHEETS_URL !== RELAY_URL) return false;
+    if (_doorPref === 'relay') return false;      // pinned by override
+    SHEETS_URL = EXEC_URL;
+    window._doorFailbackAt = Date.now() + DOOR_FAILBACK_MS;
+    console.warn('[door] relay failed (' + where + ') — using /exec for 10 min');
+    return true;
+  } catch (e) { return false; }
+}
+// Called at the top of every sync: after the fallback window, try the relay again.
+// Also the place where a PILOT device (RELAY_PILOT / RELAY_ALL, 01_config.js)
+// gets moved onto the relay once the signed-in doctor is known.
+function _doorMaybeRestore() {
+  try {
+    if (typeof RELAY_URL === 'undefined' || !RELAY_URL) return;
+    if (!relayEnabledForThisDevice()) { SHEETS_URL = EXEC_URL; return; }
+    if (SHEETS_URL === EXEC_URL) {
+      if (window._doorFailbackAt && Date.now() < window._doorFailbackAt) return;   // still in the fallback window
+      SHEETS_URL = RELAY_URL; window._doorFailbackAt = 0;
+      console.log('[door] relay');
+    }
+  } catch (e) {}
+}
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,
             'color:#1a5fa8;font-weight:600');
@@ -1058,6 +1099,7 @@ async function syncFromSheets(opts) {
   // causing two simultaneous getAll calls (8s instead of 4s). Drop the second.
   if (_syncInFlight) { console.log('[sync] already in flight — skipping'); return; }
   _syncInFlight = true;
+  _doorMaybeRestore();   // v5.20
   setSyncState('syncing');
   window._syncAttempts = (window._syncAttempts || 0) + 1;
   window._lastSyncError = null;
@@ -1163,6 +1205,13 @@ async function syncFromSheets(opts) {
         window._lastSyncResponse.checkpoint = _err ? 'fetch-failed' : 'http-error';
         window._lastSyncResponse.fetchError = window._lastSyncError;
         window._lastSyncResponse.attempts   = _attempts;
+        // v5.20: a relay 5xx or transport failure on both attempts → try the
+        // other door for a while. Server answers (4xx from the script) are
+        // not door problems and do not trigger this.
+        if (_lastCode !== 'offline' && (_err || (_resp && _resp.status >= 500)) && _doorFailover('sync')) {
+          _syncInFlight = false;
+          return await syncFromSheets(opts);       // same request, other door, right now
+        }
         setSyncState('error', { code: _lastCode });
         return;
       }
@@ -1826,6 +1875,9 @@ async function push(action, body, wire) {
         if (_pKey) delete window._pushInFlight[_pKey];
         window._lastPushError = _pe ? (_pe.message || String(_pe))
                                     : ('HTTP ' + _pr.status);
+        if (_pCode !== 'offline' && (_pe || (_pr && _pr.status >= 500)) && _doorFailover('push')) {
+          return await push(action, body, wire);   // v5.20: same write, other door, right now
+        }
         setSyncState('error', { code: _pCode });
         return false;
       }

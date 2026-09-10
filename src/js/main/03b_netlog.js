@@ -149,7 +149,9 @@ function netlogRecord(kind, detail) {
     session:    NETLOG_SESSION,
     kind:       String(kind || ''),
     action:     String(d.action     || ''),
-    checkpoint: String(d.checkpoint || ''),
+    // v5.20: tag which door the request used so the Client Errors tab can
+    // separate relay failures from /exec failures (no new column needed).
+    checkpoint: String(d.checkpoint || '') + '@' + (typeof currentDoor === 'function' ? currentDoor() : 'exec'),
     code:       String(d.code       || ''),
     errName:    String(d.errName    || ''),
     errMsg:     String(d.errMsg     || '').slice(0, 300),

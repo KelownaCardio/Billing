@@ -1,7 +1,43 @@
 // 01_config.js — URLs, ward definitions, alias map
 // ═══════════════════════════════════════════════════════
 
-var SHEETS_URL = 'https://script.google.com/macros/s/AKfycbxnd8SjEggYszjTQ3Ljcy7IlSK8PFUuXJwwKggjEqqZrWn9ED0zV3OlfQ6ka5m9y-c_/exec';
+// ─── v5.20 (2026-09-10): TWO DOORS TO THE SAME BACKEND ─────────────────
+// EXEC_URL  = the Apps Script web-app address (the only door until v5.19).
+//             A 1-hour wired-Mac probe on 2026-09-10 showed it holds or drops
+//             ~6% of requests for 20–45s before the script even starts — the
+//             source of the "network unavailable" prompts.
+// RELAY_URL = a Cloudflare Worker that calls the SAME script through the
+//             Apps Script API (no redirect leg). Same key, same routing,
+//             same JSON. Default door from v5.20.
+// SHEETS_URL is whichever door is in use right now (every module reads it).
+// Per-device override: localStorage 'kgh5:door' = 'exec' | 'relay'.
+// Automatic failover: if the relay fails a whole retry chain, the app falls
+// back to EXEC_URL for 10 minutes, then tries the relay again (03_state.js
+// _doorFailover / _doorMaybeRestore).
+var EXEC_URL  = 'https://script.google.com/macros/s/AKfycbxnd8SjEggYszjTQ3Ljcy7IlSK8PFUuXJwwKggjEqqZrWn9ED0zV3OlfQ6ka5m9y-c_/exec';
+var RELAY_URL = 'https://kgh-relay.kathrynb77.workers.dev';
+var DOOR_FAILBACK_MS = 10 * 60 * 1000;
+// PILOT (v5.20): only these signed-in aliases use the relay; everyone else
+// stays on /exec exactly as before. Flip RELAY_ALL to true (v5.21) to move
+// every device over; set RELAY_URL = '' to retire the relay entirely.
+var RELAY_ALL   = false;
+var RELAY_PILOT = ['KBrown'];
+var _doorPref = '';
+try { _doorPref = localStorage.getItem('kgh5:door') || ''; } catch (e) {}
+// The signed-in doctor is not known until loadLocal() runs, so the app starts
+// on /exec and _doorMaybeRestore() (03_state.js, top of every sync) moves a
+// pilot device onto the relay before its first request goes out.
+var SHEETS_URL = EXEC_URL;
+function currentDoor() { return (SHEETS_URL === RELAY_URL) ? 'relay' : 'exec'; }
+function relayEnabledForThisDevice() {
+  if (!RELAY_URL) return false;
+  if (_doorPref === 'exec') return false;
+  if (_doorPref === 'relay' || RELAY_ALL) return true;
+  try {
+    var a = (typeof st !== 'undefined' && st && st.doc) ? String(st.doc.alias || '') : '';
+    return a && RELAY_PILOT.indexOf(a) >= 0;
+  } catch (e) { return false; }
+}
 var APP_PW_LS_KEY = 'kgh5:appPw';
 var SHARED_KEY = '';
 try { SHARED_KEY = localStorage.getItem(APP_PW_LS_KEY) || ''; } catch (e) { SHARED_KEY = ''; }
