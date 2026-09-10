@@ -3249,6 +3249,7 @@ function handleOCRResult(data, bar) {
   // be parsed (sticker "12 MAR 1948" or Meditech "12/03/1948"), with or
   // without a printed age. The model's own `dob` is only a fallback.
   var _ocrParsed = _ocrRaw ? ocrParseDobRaw(_ocrRaw) : { ok: false };
+  var _ocrDobToasted = false;  // v5.18: a DOB refusal already explained itself
   if (_ocrAge) {
     // Printed age present: date must agree with it EXACTLY or stay blank.
     // If dobRaw is unreadable, verify the model's dob against the age instead
@@ -3259,6 +3260,7 @@ function handleOCRResult(data, bar) {
       p.dob = _ocrChk.day + '/' + _ocrChk.month + '/' + _ocrChk.year;
     } else {
       showToast('DOB not filled — ' + _ocrChk.why + '. Enter it manually.', 'error');
+      _ocrDobToasted = true;
       p.dob = '';
     }
   } else if (_ocrParsed.ok) {
@@ -3276,6 +3278,7 @@ function handleOCRResult(data, bar) {
       var _dobAge = Math.floor((Date.now() - _dobMs) / (365.25 * 86400000));
       if (_dobAge < 2 || _dobMs > Date.now()) {
         showToast('DOB "' + p.dob + '" rejected (age ' + _dobAge + ') — likely admission date', 'error');
+        _ocrDobToasted = true;
         p.dob = '';  // Don't populate — leave blank for manual entry
       }
     }
@@ -3285,6 +3288,12 @@ function handleOCRResult(data, bar) {
   if (p.first) document.getElementById('f-first').value = p.first;
   if (p.phn)   document.getElementById('f-phn').value   = (p.phn + '').replace(/\D/g,'').slice(0,10);
   if (p.dob)   document.getElementById('f-dob').value   = dispDate(p.dob);
+  // v5.18 (Kathryn 2026-09-10): a scan that found no usable DOB used to leave
+  // the field blank with no explanation. Every deliberate refusal above
+  // already toasts; this covers the silent case.
+  if (!p.dob && !_ocrDobToasted) {
+    showToast('DOB not read - please enter manually', 'error');
+  }
   // v4.13: setting .value above does not fire the oninput handlers, so run
   // the live OCR-error flag explicitly. If OCR truncated the PHN or pulled
   // a number/slash into the last name, the field turns red immediately —
