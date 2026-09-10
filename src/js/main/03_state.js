@@ -529,7 +529,10 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 // format change; BUILD_ID not bumped. Files: 09_patient.js (helper +
 // sticker camera/gallery/paste), 10_location.js, 13_meditech.js,
 // 13b_phoneadvice.js, 03_state.js (this file).
-var APP_VERSION = 'v5.16';
+// v5.17 (2026-09-10) — DOB OCR reads the new KGH sticker format "DD MMM YYYY"
+//   (e.g. "12 MAR 1948") as well as Meditech "DD/MM/YYYY". Date is now parsed in
+//   code from the printed text on every scan (09_patient.js ocrParseDobRaw).
+var APP_VERSION = 'v5.17';
 var APP_BUILT   = '2026-09-09';
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,
