@@ -534,8 +534,33 @@ var BUILD_ID    = 'v4.51-2026-06-28-dedup-export';
 //   code from the printed text on every scan (09_patient.js ocrParseDobRaw).
 // v5.18 (2026-09-10) — red toast "DOB not read - please enter manually" when a
 //   scan returns no usable DOB (previously a silent blank).
-var APP_VERSION = 'v5.18';
-var APP_BUILT   = '2026-09-09';
+// v5.19 (2026-09-10) — DELTA SYNC + SUMMARY CONFLICT GUARD. Kathryn's #1
+//   priority is speed. 09-09/09-10 Client Errors: ~110 user-facing "network
+//   unavailable" prompts in two days, nearly all 20s client timeouts on FULL
+//   getAll pulls (~420KB) the server timed at <12s; 63 of them from HIDDEN
+//   tabs. The 30s ping made every visible device re-pull EVERYTHING whenever
+//   anyone saved anything (getAll volume doubled on 09-09: 1,614).
+//   Now (needs Router v3.21 + Crud v3.23; falls back to getAll on an older
+//   backend):
+//   • syncFromSheets() asks action=sync&since=<ver> — "nothing changed" is a
+//     ~100-byte reply; a change is a few-KB DELTA of just the rows that
+//     changed (served from the server's journal, zero sheet reads) merged
+//     with the same pending-push / hot-group rules as before.
+//   • Full getAll only on app open, on the first sync after 10 min, or when
+//     the server says the journal can't cover the gap.
+//   • Timers (14_init.js): ONE 60s poll while VISIBLE, editing-screen
+//     guarded; nothing at all while hidden. The separate ping loop and the
+//     5-min hidden-tab refresh are gone. A doctor's own add/remove shows on
+//     their own device instantly as before; other devices see it within
+//     ~60s (Kathryn: a couple of minutes is fine).
+//   • Notes editor (06c) sends summaryBase; a save that would overwrite a
+//     NEWER summary is refused by the server and the merge dialog opens
+//     with the other doctor's text + your draft — nothing is lost silently.
+//     Handover flag stays on tap-timestamp last-write-wins.
+//   Files: 03_state.js, 14_init.js, 06c_patient_summary.js. No cache-format
+//   change; BUILD_ID not bumped.
+var APP_VERSION = 'v5.19';
+var APP_BUILT   = '2026-09-10';
 
 console.log('%c[KGH Billing] ' + APP_VERSION + ' · built ' + APP_BUILT,
             'color:#1a5fa8;font-weight:600');
@@ -866,7 +891,167 @@ function syncWithGuardIfStale() {
 }
 
 var _syncInFlight = false;
-async function syncFromSheets() {
+// v5.19: delta-sync state. _syncVer = the server journal counter this device
+// is caught up to (0/undefined = never full-synced this session → full pull).
+var SYNC_FULL_EVERY_MS = 10 * 60 * 1000;   // full re-pull at most this often (also covers writes that bypass the journal: PhoneAdvice web app, email processor, nightly archive)
+window._syncVer        = window._syncVer || 0;
+window._lastFullSyncAt = window._lastFullSyncAt || 0;
+window._syncNoDelta    = window._syncNoDelta || false;   // backend answered "unknown action" → stay on getAll this session
+
+// v5.19: normalisers shared by the full merge and the delta merge — one
+// place, so a delta row can never be shaped differently from a full row.
+function _normRemotePatient(p) {
+  if (p.dob) p.dob = fmtClaimDate(p.dob);
+  if (p.roundedToday) p.roundedToday = fmtClaimDate(p.roundedToday);
+  if (p.dischargedAt) p.dischargedAt = parseDischargedAt(p.dischargedAt);
+  p.discharged = parseBool(p.discharged);
+  if (p.phn   != null) p.phn   = String(p.phn);
+  if (p.bed   != null) p.bed   = String(p.bed);
+  if (p.last  != null) p.last  = fmtName(p.last);
+  if (p.first != null) p.first = fmtName(p.first);
+  return p;
+}
+function _normRemoteClaim(c) {
+  if (c.date)      c.date      = fmtClaimDate(c.date);
+  if (c.startTime) c.startTime = fmtStartTime(c.startTime);
+  if (c.endTime)   c.endTime   = fmtStartTime(c.endTime);
+  if (c.fee)       c.fee       = String(c.fee).trim();
+  if (c.feeCode)   c.feeCode   = String(c.feeCode).trim();
+  if (c.icd)       c.icd       = String(c.icd).trim();
+  if (c.phn != null) c.phn = String(c.phn);
+  return c;
+}
+// One remote patient row against the local copy — the v4.72 rules:
+// pending local push → keep local, overlay newer remote hot groups;
+// otherwise remote wins except hot groups where the local tap is newer
+// (those are re-asserted with a push). Returns the object to keep.
+function _mergeRemotePatient(rp, lp) {
+  if (!lp) return rp;
+  var isPending = window._pendingPush && window._pendingPush[lp.id];
+  if (isPending) {
+    var keep = Object.assign({}, lp);
+    mergeHotFieldsFrom(keep, rp);
+    // v5.19: a later retry must send THIS object (local + newer remote hot
+    // groups), not the detached pre-merge copy.
+    if (isPending.body && !isPending.queued) isPending.body = keep;
+    return keep;
+  }
+  var out = Object.assign({}, rp);
+  if (mergeHotFieldsFrom(out, lp) && SHEETS_URL) push('savePatient', out);
+  return out;
+}
+// Clear a patient's pending entry once the remote row reflects it (or 60s).
+function _confirmPendingPatient(rp) {
+  if (!window._pendingPush || !window._pendingPush[rp.id]) return;
+  var pending = window._pendingPush[rp.id].body;
+  var dischMatch = parseBool(rp.discharged) === parseBool(pending.discharged);
+  var dischAtMatch = !pending.dischargedAt ||
+    (parseDischargedAt(rp.dischargedAt) === parseDischargedAt(pending.dischargedAt));
+  var _hoNorm = function(v) { return (!!v && v !== 'false') ? String(v) : ''; };
+  var hoMatch = _hoNorm(rp.handover) === _hoNorm(pending.handover);
+  var stale = (Date.now() - (window._pendingPush[rp.id].ts || 0)) > 60000;
+  if ((dischMatch && dischAtMatch && hoMatch) || stale) delete window._pendingPush[rp.id];
+}
+// v5.08 role self-heal, shared by every sync shape (was in the ping loop).
+function _applyServerRole(d) {
+  if (!d || !d.role || d.role === st.role) return;
+  st.role = d.role;
+  sv('role', st.role);
+  if (isResident() && (!st.doc || st.doc.alias !== 'Resident')) {
+    st.doc = { alias: 'Resident', num: '', name: 'Resident' };
+    sv('doc', st.doc);
+  }
+  try { applyResidentChrome(); } catch (eC) {}
+  try { render(); } catch (eR) {}
+}
+
+// v5.19: apply a DELTA response — upsert the changed rows, drop the deleted
+// ones. No healers / back-fill pushes here (those run on full pulls).
+function _applySyncDelta(d) {
+  var gapKey = function(g) { return 'g|' + String(g.phn||'').replace(/\D/g,'') + '|' + String(g.date||''); };
+  var delP = {}, delC = {};
+  ((d.deleted && d.deleted.patients) || []).forEach(function(id) { delP[String(id)] = 1; });
+  ((d.deleted && d.deleted.claims)   || []).forEach(function(id) { delC[String(id)] = 1; });
+
+  (d.patients || []).forEach(function(rp) {
+    _normRemotePatient(rp);
+    sanitizeReferrer(rp);
+    var idx = -1;
+    for (var i = 0; i < st.patients.length; i++) { if (st.patients[i].id === rp.id) { idx = i; break; } }
+    var keep = _mergeRemotePatient(rp, idx >= 0 ? st.patients[idx] : null);
+    if (idx >= 0) st.patients[idx] = keep; else st.patients.push(keep);
+    _confirmPendingPatient(rp);
+  });
+  if (Object.keys(delP).length) {
+    st.patients = st.patients.filter(function(p) {
+      // a delete from another device removes it here too — unless this
+      // device has an unsent save for it (its push will re-create / be refused)
+      return !delP[String(p.id)] || (window._pendingPush && window._pendingPush[p.id]);
+    });
+  }
+
+  (d.claims || []).forEach(function(rc) {
+    _normRemoteClaim(rc);
+    sanitizeReferrer(rc);
+    var idx = -1;
+    for (var j = 0; j < st.claims.length; j++) { if (st.claims[j].id === rc.id) { idx = j; break; } }
+    var pe = window._pendingPush && window._pendingPush[rc.id];
+    if (pe && pe.queued && pe.action) {
+      // newer local edit parked behind an in-flight save: send it, keep it
+      delete window._pendingPush[rc.id];
+      if (idx >= 0 && pe.action === 'saveClaim' && pe.body) st.claims[idx] = pe.body;
+      if (SHEETS_URL) push(pe.action, pe.body, pe.wire || undefined);
+      return;
+    }
+    if (window._pushInFlight && window._pushInFlight[rc.id]) return;   // our save is mid-flight — its reply settles it
+    if (pe) delete window._pendingPush[rc.id];   // the sheet shows the row → confirmed (same as the full path)
+    if (idx >= 0) st.claims[idx] = rc; else st.claims.push(rc);
+  });
+  if (Object.keys(delC).length) {
+    st.claims = st.claims.filter(function(c) {
+      return !delC[String(c.id)] || (window._pendingPush && window._pendingPush[c.id]);
+    });
+  }
+
+  (d.gapNotes || []).forEach(function(g) {
+    var k = gapKey(g);
+    if (window._pendingPush) delete window._pendingPush[k];
+    var found = false;
+    st.gapNotes = st.gapNotes || [];
+    for (var m = 0; m < st.gapNotes.length; m++) {
+      if (gapKey(st.gapNotes[m]) === k) { st.gapNotes[m] = g; found = true; break; }
+    }
+    if (!found) st.gapNotes.push(g);
+  });
+}
+
+// v5.19: a failed write used to wait for the next FULL sync to be re-sent
+// (the full merge re-pushes pending rows). Deltas don't walk the whole list,
+// so re-send stragglers here — anything pending >30s and not in flight.
+// Every action that reaches _pendingPush is upsert-keyed, so a re-send of a
+// write that actually landed is a no-op server-side.
+function _retryPendingPushes() {
+  if (!SHEETS_URL) return;
+  var pp = window._pendingPush || {};
+  var now = Date.now();
+  Object.keys(pp).forEach(function(k) {
+    var e = pp[k];
+    if (!e || !e.action || !e.body) return;
+    if (window._pushInFlight && window._pushInFlight[k]) return;
+    if (now - (e.ts || 0) < 30000) return;
+    // A `queued` entry (parked behind an in-flight save) whose in-flight
+    // save has long finished has no other sender for patients — send it.
+    if (e.queued) delete pp[k];
+    // Only rows that still exist locally: a save whose row was since
+    // deleted/un-billed on this device must not be resurrected (review
+    // finding, 2026-09-10).
+    if (e.action === 'saveClaim'   && !(st.claims   || []).some(function(c) { return String(c.id) === String(k); })) { delete pp[k]; return; }
+    if (e.action === 'savePatient' && !(st.patients || []).some(function(p) { return String(p.id) === String(k); })) { delete pp[k]; return; }
+    push(e.action, e.body, e.wire || undefined);
+  });
+}
+
+async function syncFromSheets(opts) {
 
   if (!SHEETS_URL) return;
   // v4.46: Dedup guard — visibilitychange + pageshow both fire on iOS resume,
@@ -897,6 +1082,11 @@ async function syncFromSheets() {
     var r = null, _parsed = null;
     var _lastCode = '', _lastErr = null, _attempts = 0;
     var NETLOG_SYNC_TIMEOUT_MS = 20000;
+    // v5.19: delta unless a full pull is due / forced / unsupported.
+    var _wantFull = !!(opts && opts.full) || !window._syncVer || window._syncNoDelta ||
+                    (Date.now() - (window._lastFullSyncAt || 0)) > SYNC_FULL_EVERY_MS;
+    var _syncAction = _wantFull ? 'getAll' : 'sync';
+    window._lastSyncResponse.mode = _syncAction;
     for (var _try = 1; _try <= 2; _try++) {
       _attempts = _try;
       var _t0 = Date.now();
@@ -913,7 +1103,9 @@ async function syncFromSheets() {
       var _resp = null, _err = null;
       try {
         // Cache-bust URL with timestamp to defeat any iOS BFCache fetch interception
-        var url = SHEETS_URL + '?action=getAll&key=' + SHARED_KEY + '&_t=' + Date.now();
+        var url = SHEETS_URL + '?action=' + _syncAction + '&key=' + SHARED_KEY +
+                  (_syncAction === 'sync' ? '&since=' + (window._syncVer || 0) : '') +
+                  '&_t=' + Date.now();
         _resp = await fetch(url, fetchOpts);
         // Parse INSIDE the loop, not after it. A response that arrives
         // truncated — the exact failure this whole change is chasing —
@@ -936,7 +1128,7 @@ async function syncFromSheets() {
         // transient transport drop and not a backend fault.
         if (_try > 1) {
           netlogRecord('sync', {
-            action: 'getAll', checkpoint: 'fetch-returned', code: _lastCode,
+            action: _syncAction, checkpoint: 'fetch-returned', code: _lastCode,
             errName: _lastErr ? String(_lastErr.name || '') : '',
             errMsg:  _lastErr ? String(_lastErr.message || _lastErr) : '',
             attempt: _try, recovered: true, durationMs: Date.now() - _t0
@@ -949,7 +1141,7 @@ async function syncFromSheets() {
       _lastErr  = _err;
       _lastCode = netlogClassify(_err, _resp);
       netlogRecord('sync', {
-        action: 'getAll', checkpoint: _err ? 'fetch-failed' : 'http-error',
+        action: _syncAction, checkpoint: _err ? 'fetch-failed' : 'http-error',
         code: _lastCode,
         errName: _err ? String(_err.name || '') : '',
         errMsg:  _err ? String(_err.message || _err)
@@ -1003,6 +1195,46 @@ async function syncFromSheets() {
       return;
     }
     if (typeof resetUnauthCount === 'function') resetUnauthCount();  // v4.66: authorized → clear transient-unauth counter
+    // v5.19: backend without delta support (Router < v3.21, or Crud < v3.23
+    // → "sync unavailable") — stay on getAll for this session, re-run now.
+    if (_syncAction === 'sync' && d && d.ok === false && d.error &&
+        /unknown action|sync unavailable/i.test(String(d.error))) {
+      window._syncNoDelta = true;
+      _syncInFlight = false;
+      return await syncFromSheets({ full: true });
+    }
+    if (_syncAction === 'sync' && d && d.ok && d.noChange) {
+      _applyServerRole(d);
+      if (d.ver) window._syncVer = Number(d.ver) || window._syncVer;
+      if (d.lastWriteAt) window._lastSeenWriteAt = String(d.lastWriteAt);
+      window._lastSyncResponse.checkpoint = 'no-change';
+      window._lastSyncOkAt = Date.now();
+      setSyncState('synced');
+      try { if (!isResident()) netlogFlush(); } catch (eNl0) {}
+      _retryPendingPushes();
+      return;
+    }
+    if (_syncAction === 'sync' && d && d.ok && d.delta) {
+      _applyServerRole(d);
+      _applySyncDelta(d);
+      if (d.ver) window._syncVer = Number(d.ver) || window._syncVer;
+      if (d.lastWriteAt) window._lastSeenWriteAt = String(d.lastWriteAt);
+      ['patients','claims','gapNotes'].forEach(function(k) { sv(k, st[k]); });
+      _retryPendingPushes();
+      window._lastSyncResponse.checkpoint = 'delta-applied';
+      window._lastSyncResponse.deltaPatients = (d.patients || []).length;
+      window._lastSyncResponse.deltaClaims   = (d.claims || []).length;
+      window._lastSyncOkAt = Date.now();
+      setSyncState('synced');
+      try { if (!isResident()) netlogFlush(); } catch (eNl1) {}
+      render();
+      var dischPane0 = document.getElementById('p-discharged');
+      if (dischPane0 && dischPane0.classList.contains('on')) {
+        var searchEl0 = document.getElementById('discharged-search');
+        renderDischarged(searchEl0 ? searchEl0.value : '');
+      }
+      return;
+    }
     if (d.error) {
       window._lastSyncError = 'Apps Script: ' + d.error;
       // v5.04: a clean 200 carrying {error} is a BACKEND fault, not a
@@ -1029,17 +1261,7 @@ async function syncFromSheets() {
       window._lastSyncResponse.patientsMergeRan = true;
       d.patients = dedupById(d.patients);   // v4.64: collapse same-id sheet rows (keep last)
       d.patients.forEach(function(p) {
-        // Normalise DOB from Sheets ISO timestamp
-        if (p.dob) p.dob = fmtClaimDate(p.dob);
-        if (p.roundedToday) p.roundedToday = fmtClaimDate(p.roundedToday);
-        if (p.dischargedAt) p.dischargedAt = parseDischargedAt(p.dischargedAt);
-        p.discharged   = parseBool(p.discharged);
-        // Coerce phn/bed/last/first to string — Sheets returns them as numbers when
-        // the cell happens to be all-digits, breaking string ops like .slice and lookup keys.
-        if (p.phn   != null) p.phn   = String(p.phn);
-        if (p.bed   != null) p.bed   = String(p.bed);
-        if (p.last  != null) p.last  = fmtName(p.last);
-        if (p.first != null) p.first = fmtName(p.first);
+        _normRemotePatient(p);   // v5.19: shared with the delta path
         var hadBadRef = looksLikeMRPService(p.refbyName);
         sanitizeReferrer(p);
         // v5.08: the backend drops refbyName from a resident's save (not on the
@@ -1067,53 +1289,14 @@ async function syncFromSheets() {
       var remoteById = {};
       d.patients.forEach(function(p) { remoteById[p.id] = true; });
 
+      // v5.19: per-row merge + pending confirmation now live in
+      // _mergeRemotePatient / _confirmPendingPatient (shared with the delta
+      // path) — same v4.72 rules, unchanged.
       var merged = d.patients.map(function(rp) {
         var lp = st.patients.find(function(p) { return p.id === rp.id; });
-        if (!lp) return rp;
-        // If a push for this patient is still pending (not yet confirmed by Sheets),
-        // the local version reflects an unconfirmed update — prefer local.
-        // This prevents discharge / restore / field updates from being clobbered
-        // by a stale remote row when sync runs before the push completes.
-        var isPending = window._pendingPush && window._pendingPush[lp.id];
-        if (isPending) {
-          // v4.72: even while local is pending, a NEWER remote tap on a hot
-          // field (the other doctor flagged/cleared after us) wins that field.
-          var keep = Object.assign({}, lp);
-          mergeHotFieldsFrom(keep, rp);
-          return keep;
-        }
-        // Otherwise remote wins — EXCEPT hot fields where the local tap is
-        // newer (v4.72): our clear/flag hasn't landed on Sheets yet (push
-        // lost, or the getAll snapshot predates it). Keep the newer local
-        // value and re-assert it on Sheets.
-        var out = Object.assign({}, rp);
-        if (mergeHotFieldsFrom(out, lp) && SHEETS_URL) {
-          push('savePatient', out);
-        }
-        return out;
+        return _mergeRemotePatient(rp, lp);
       });
-
-      // Clear pending entries ONLY if the remote row reflects the pending update.
-      // We compare a few key fields that update-style pushes touch.
-      d.patients.forEach(function(rp) {
-        if (!window._pendingPush || !window._pendingPush[rp.id]) return;
-        var pending = window._pendingPush[rp.id].body;
-        // Confirm by checking the discharged flag (most common update) and dischargedAt timestamp
-        var dischMatch = parseBool(rp.discharged) === parseBool(pending.discharged);
-        var dischAtMatch = !pending.dischargedAt ||
-          (parseDischargedAt(rp.dischargedAt) === parseDischargedAt(pending.dischargedAt));
-        // v4.72: also require the handover flag to match. Previously only the
-        // discharged fields were compared, so a handover clear was "confirmed"
-        // by a getAll snapshot taken BEFORE the clear landed — remote-wins then
-        // resurrected the flag on the very device that cleared it.
-        var _hoNorm = function(v) { return (!!v && v !== 'false') ? String(v) : ''; };
-        var hoMatch = _hoNorm(rp.handover) === _hoNorm(pending.handover);
-        // Generous timeout fallback: clear pending after 60s regardless
-        var stale = (Date.now() - (window._pendingPush[rp.id].ts || 0)) > 60000;
-        if ((dischMatch && dischAtMatch && hoMatch) || stale) {
-          delete window._pendingPush[rp.id];
-        }
-      });
+      d.patients.forEach(_confirmPendingPatient);
 
       // Keep local patients that are either in-flight OR pending unconfirmed push.
       st.patients.forEach(function(lp) {
@@ -1153,17 +1336,8 @@ async function syncFromSheets() {
       d.claims.forEach(function(c) {
         var hadBadRef = looksLikeMRPService(c.refbyName);
         sanitizeReferrer(c);
-        if (c.date)      c.date      = fmtClaimDate(c.date);
-        if (c.startTime) c.startTime = fmtStartTime(c.startTime);
-        if (c.fee)       c.fee       = String(c.fee).trim();
-        if (c.feeCode)   c.feeCode   = String(c.feeCode).trim();
-        if (c.icd)       c.icd       = String(c.icd).trim();
-        if (c.phn != null) c.phn = String(c.phn);
+        _normRemoteClaim(c);   // v5.19: shared with the delta path
         if (hadBadRef && SHEETS_URL && !isResident()) push('saveClaim', c);   // v5.08: saveClaim is blocked for residents anyway
-      });
-      // Normalise startTime — Sheets returns time-only fields as ISO with 1899 epoch
-      d.claims.forEach(function(c) {
-        if (c.startTime) c.startTime = fmtStartTime(c.startTime);
       });
       var remoteClaimIds = {};
       d.claims.forEach(function(c) { remoteClaimIds[c.id] = true; });
@@ -1189,7 +1363,7 @@ async function syncFromSheets() {
           // refused too, not smuggled past arbitration with a fresh stamp.
           var _mi = mergedClaims.indexOf(c);
           if (_mi >= 0 && pe.action === 'saveClaim' && pe.body) mergedClaims[_mi] = pe.body;
-          if (SHEETS_URL) push(pe.action, pe.body);
+          if (SHEETS_URL) push(pe.action, pe.body, pe.wire || undefined);
           return;
         }
         delete window._pendingPush[c.id];
@@ -1356,6 +1530,11 @@ async function syncFromSheets() {
     window._lastSyncResponse.stClaimsFinal = st.claims.length;
     window._lastSyncOkAt = Date.now();   // v4.73: resume-guard staleness marker
     if (d.lastWriteAt) window._lastSeenWriteAt = String(d.lastWriteAt);   // v4.75: ping-sync re-baseline
+    // v5.19: a full pull is the delta baseline. No `ver` in the reply means
+    // Router < v3.21 — _syncVer stays 0 and every sync remains a full pull.
+    window._lastFullSyncAt = Date.now();
+    window._syncVer = Number(d.ver) || 0;
+    _applyServerRole(d);
     setSyncState('synced');
     // v5.04: we are demonstrably online RIGHT NOW — the one safe moment to
     // ship any buffered failure records. Fire-and-forget; a flush that
@@ -1506,7 +1685,10 @@ async function commitClaimGate(g, consult) {
   return false;
 }
 
-async function push(action, body) {
+async function push(action, body, wire) {
+  // v5.19: `wire` = fields that ride on the request ONLY (never stored on
+  // the st.* object) — the notes editor's summaryBase. Same idea as the
+  // v5.12 `arbitrate` flag on claims.
   // v5.12: inside a claim gate, capture instead of sending (see above).
   // Safety valve: a gate is synchronous and lives milliseconds. One left
   // open by an exception would silently swallow every claim save for the
@@ -1539,6 +1721,11 @@ async function push(action, body) {
   // the mandatory-update reload gate can wait out a quiet period rather than
   // aborting an untracked write (deleteClaim, savePatients, the log* calls).
   window._lastPushAt = Date.now();
+  // v5.19: a delete supersedes any unconfirmed save of the same row — the
+  // old save must never be re-sent by _retryPendingPushes and re-create it.
+  if ((action === 'deleteClaim' || action === 'deletePatient') && body && body.id && window._pendingPush) {
+    delete window._pendingPush[body.id];
+  }
 
   // v4.25: In-flight guard — if a fetch for this exact ID is already running,
   // skip silently. The pending retry will catch it on the next sync cycle
@@ -1557,7 +1744,7 @@ async function push(action, body) {
       // back in ~1s. Queue the NEWER body before returning, otherwise a
       // doctor who corrects a fee mid-retry gets a success toast for a
       // value that was never sent anywhere.
-      window._pendingPush[_pKey] = { action: action, body: body, ts: Date.now(), queued: true };  // v5.12: tagged — see syncFromSheets
+      window._pendingPush[_pKey] = { action: action, body: body, ts: Date.now(), queued: true, wire: wire || null };  // v5.12: tagged — see syncFromSheets; v5.19: keeps wire
       return true;  // true = don't trigger error handling
     }
     window._pushInFlight[_pKey] = true;
@@ -1565,7 +1752,7 @@ async function push(action, body) {
   // Mark as pending until next successful sync confirms it
   var _pStart = Date.now();
   if (_pKey) {
-    window._pendingPush[_pKey] = { action: action, body: body, ts: _pStart };
+    window._pendingPush[_pKey] = { action: action, body: body, ts: _pStart, wire: wire || null };   // v5.19: wire kept for retries
   }
   // v5.04 review fix: with the retry chain, this push can be in flight for
   // up to ~25s — long enough for the doctor to save the SAME record again.
@@ -1604,8 +1791,8 @@ async function push(action, body) {
         // v5.12: opt this build into Crud v3.21 claim arbitration. The flag
         // rides on the wire only — never on the st.claims object.
         var _pBody = (action === 'saveClaim')
-          ? JSON.stringify(Object.assign({}, body, { arbitrate: true }))
-          : JSON.stringify(body);
+          ? JSON.stringify(Object.assign({}, body, { arbitrate: true }, wire || {}))
+          : (wire ? JSON.stringify(Object.assign({}, body, wire)) : JSON.stringify(body));
         _pr = await fetch(_pUrl, _pCtrl
           ? { method: 'POST', body: _pBody, signal: _pCtrl.signal }
           : { method: 'POST', body: _pBody });
@@ -1681,6 +1868,20 @@ async function push(action, body) {
       // starts from it. The toast is the only thing the doctor sees.
       if (data.stale) {
         if (_pKey && !_pendingIsNewer()) delete window._pendingPush[_pKey];
+        // v5.19: Crud v3.23 summary stale guard — the caller
+        // (savePatientNotes) owns the merge dialog; hand it the server row.
+        if (data.field === 'summary') {
+          window._lastPushStale = data;
+          // Put the server's summary group on the local row NOW, whoever
+          // sent this (notes editor, a retry, a hot-group re-assert): the
+          // local tap must stop looking newer, or the next merge would
+          // re-assert our text WITHOUT summaryBase and LWW would silently
+          // overwrite theirs (second-pass review, 2026-09-10). The draft is
+          // parked for the editor to offer as a merge.
+          try { if (typeof _pnApplyStaleRow === 'function') _pnApplyStaleRow(body && body.id, data.patient, body && body.summary); } catch (e) {}
+          setSyncState('synced');
+          return false;
+        }
         try { showToast('Changed on another device — refreshing this claim', 'warn'); } catch (e) {}
         // Resync so the next save starts from the newer row — but never
         // underneath an open editor (same guards as _autoRefreshSync); in

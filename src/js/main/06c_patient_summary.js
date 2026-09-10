@@ -74,6 +74,17 @@ function openPatientNotes(pid) {
     var ta = document.getElementById('pn-text');
     if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
   }, 120);
+  // v5.19: a refused save parked its text (see _pnApplyStaleRow) — offer it
+  // under the current version so the doctor merges instead of retyping.
+  var _lost = window._pnLostDraft && window._pnLostDraft[String(p.id)];
+  if (_lost) {
+    delete window._pnLostDraft[String(p.id)];
+    setTimeout(function() {
+      var ta3 = document.getElementById('pn-text');
+      if (ta3) ta3.value = String(getP(p.id).summary || '') +
+        '\n\n----- your unsaved draft (merge above, delete this line, then Save) -----\n' + _lost;
+    }, 160);
+  }
 
   // v4.74: background refresh so the doctor is almost always reading the
   // latest blurb — collision warning on Save becomes the rare last resort.
@@ -133,7 +144,41 @@ function _pnRefreshOnOpen(pid) {
   });
 }
 
-function savePatientNotes(pid) {
+// v5.19: after the server refused a save as stale (Crud v3.23 summary
+// guard — another doctor's newer notes landed after this editor opened and
+// before our own delta could show them): put the server's version back on
+// the local patient, then reopen the editor with their text + our draft
+// appended, exactly like the Cancel branch of the local collision check.
+// Step 1 — called by push() itself for ANY refused summary save (first try,
+// a 20s-timeout retry, or a merge re-assert): put the server's summary
+// group on the local row, park the refused text as a draft, toast.
+window._pnLostDraft = window._pnLostDraft || {};
+function _pnApplyStaleRow(pid, srvPat, draft) {
+  var p = pid ? getP(pid) : null;
+  if (!p) return;
+  if (srvPat && typeof srvPat === 'object' && String(srvPat.id || pid) === String(pid)) {
+    p.summary          = srvPat.summary == null ? '' : String(srvPat.summary);
+    p.summaryUpdatedAt = srvPat.summaryUpdatedAt == null ? '' : String(srvPat.summaryUpdatedAt);
+    p.summaryUpdatedBy = srvPat.summaryUpdatedBy == null ? '' : String(srvPat.summaryUpdatedBy);
+    if (srvPat.fieldTs != null) p.fieldTs = typeof srvPat.fieldTs === 'string' ? srvPat.fieldTs : JSON.stringify(srvPat.fieldTs);
+  }
+  if (draft != null && String(draft).trim() && String(draft).trim() !== String(p.summary || '').trim()) {
+    window._pnLostDraft[String(pid)] = String(draft);
+  }
+  sv('patients', st.patients);
+  try { render(); } catch (e) {}
+  var _who = (srvPat && srvPat.summaryUpdatedBy) ? String(srvPat.summaryUpdatedBy) : 'another doctor';
+  var _nm  = [String(p.first || ''), String(p.last || '').toUpperCase()].filter(Boolean).join(' ');
+  try { showToast('Notes for ' + _nm + ' NOT saved \u2014 ' + _who + ' updated them first. Open the notes to merge.', 'error'); } catch (e) {}
+}
+// Step 2 — the notes editor reopens on THEIR text with the parked draft
+// appended (openPatientNotes does the append whenever a draft is parked).
+function _pnApplyStaleAndMerge(pid, srvPat, draft) {
+  _pnApplyStaleRow(pid, srvPat, draft);
+  openPatientNotes(pid);
+}
+
+async function savePatientNotes(pid) {
   var p = getP(pid);
   if (!p) return;
   var ta = document.getElementById('pn-text');
@@ -149,6 +194,11 @@ function savePatientNotes(pid) {
     return;
   }
 
+  // v5.19: the baseline this editor opened on (re-baselined by refresh-on-
+  // open). Sent wire-only; the server refuses the save if the row has been
+  // given a NEWER summary since — see _pnApplyStaleAndMerge above.
+  var _base = String(window._pnOpenSummaryTs || '0');
+
   // v4.73: COLLISION CHECK — someone else's edit landed (via sync) while this
   // modal was open. Warn instead of silently overwriting their text.
   var _curTs = String(p.summaryUpdatedAt || '');
@@ -159,6 +209,9 @@ function savePatientNotes(pid) {
       ' while you were editing.\n\n' +
       'OK — save YOUR version (replaces theirs)\n' +
       'Cancel — view their latest version; your draft is kept below it so you can merge, then Save');
+    // v5.19: "OK" means overwrite what the device has ALREADY seen — send
+    // that version as the base so the server's guard lets it through.
+    if (_overwrite) _base = _curTs;
     if (!_overwrite) {
       var _draft = newText;
       openPatientNotes(pid);   // re-opens with the latest text + fresh baseline
@@ -180,11 +233,21 @@ function savePatientNotes(pid) {
   stampChangedGroups(p, _hotSnap);   // v4.73: summary group tap timestamp
 
   sv('patients', st.patients);
-  if (SHEETS_URL) push('savePatient', p);
   logChange(p, 'Summary updated', alias);
 
   hideModal('pt-notes-modal');
   showToast('Notes saved');
+
+  if (SHEETS_URL) {
+    window._lastPushStale = null;
+    var _ok = await push('savePatient', p, { summaryBase: _base });
+    var _st = window._lastPushStale;
+    if (!_ok && _st && _st.stale && _st.field === 'summary' &&
+        (!_st.patient || !_st.patient.id || String(_st.patient.id) === String(pid))) {
+      window._lastPushStale = null;
+      openPatientNotes(pid);   // push() already applied the server row + parked the draft
+    }
+  }
 }
 
 // ── Claim history view (existing) ──────────────────────────────────────

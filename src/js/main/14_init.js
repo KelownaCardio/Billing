@@ -260,11 +260,11 @@ async function init() {
       if (window._kghReadyResolve) window._kghReadyResolve({ ok:false, error:String(e && e.message || e) });  // v5.12
     }
 
-    // v4.39: Auto-refresh every 5 min so other doctors' changes (including
-    // handover summaries from the email processor) appear without closing
-    // and reopening the app.
-    // v4.72: body extracted to _autoRefreshSync so the handover-hours fast
-    // poll below can share the editing-screen guards.
+    // v4.39: Auto-refresh so other doctors' changes (including handover
+    // summaries from the email processor) appear without closing and
+    // reopening the app.
+    // v4.72: body extracted to _autoRefreshSync so the pollers can share the
+    // editing-screen guards.
     async function _autoRefreshSync(tag) {
       // Skip if any editing screen is open — don't clobber mid-edit state
       var claimOpen = document.getElementById('p-claim') &&
@@ -281,81 +281,32 @@ async function init() {
       }
       try {
         await syncFromSheets();
-        render();
-        console.log('[' + tag + '] synced');
+        // v5.19: a "nothing changed" poll answer leaves state untouched —
+        // don't redraw the list for it (delta/full syncs render themselves).
+        var _nc = window._lastSyncResponse && window._lastSyncResponse.checkpoint === 'no-change';
+        if (!_nc) render();
+        console.log('[' + tag + '] ' + (_nc ? 'no change' : 'synced'));
       } catch(e) {
         console.log('[' + tag + '] failed:', e);
       }
     }
-    setInterval(function() { _autoRefreshSync('auto-refresh'); }, 5 * 60 * 1000);
-
-    // v4.75: PING SYNC — replaces the v4.72 handover-window fast poll.
-    // Every 30s (app visible only) hit the cheap `ping` action (~0.3s, no
-    // sheet reads) and compare its lastWriteAt marker; a change means
-    // someone saved something → run a full guarded sync. Result: other
-    // doctors' changes appear within ~30-45s ALL DAY, and the server does
-    // full-dataset work only when something actually changed. Graceful on
-    // an old backend (no lastWriteAt in the response → no-op; the 5-min
-    // full sync above still runs as the safety net — it also covers the
-    // PhoneAdvice project + email processor, which don't stamp the marker).
-    async function _pingForChanges() {
-      if (!SHEETS_URL) return;
-      try {
-        var r = await fetch(SHEETS_URL + '?action=ping&key=' + SHARED_KEY +
-                            '&_t=' + Date.now(), { cache: 'no-store' });
-        if (!r.ok) {
-          netlogRecordThrottled('ping', {
-            action: 'ping', checkpoint: 'keepalive', code: 'http_' + r.status,
-            errMsg: 'HTTP ' + r.status + ' ' + (r.statusText || ''),
-            httpStatus: r.status, attempt: 1, recovered: false
-          });
-          return;
-        }
-        var d = await r.json();
-        // v5.08: ping is the one call every device makes all day, and it now
-        // reports the role this password grants. Re-stamp it here so a device
-        // whose stored role was lost (cleared site data, storage eviction,
-        // a resident device that first signed in on an older build) self-heals
-        // to the right UI on the next tick instead of falling back to the MD
-        // layout. Cheap: only touches state when it actually differs.
-        if (d && d.role && d.role !== st.role) {
-          st.role = d.role;
-          sv('role', st.role);
-          if (isResident() && (!st.doc || st.doc.alias !== 'Resident')) {
-            st.doc = { alias: 'Resident', num: '', name: 'Resident' };
-            sv('doc', st.doc);
-          }
-          try { applyResidentChrome(); } catch (eC) {}
-          try { render(); } catch (eR) {}
-        }
-        if (!d || !d.lastWriteAt) return;          // old backend / no writes yet
-        var seen = window._lastSeenWriteAt;
-        if (seen === undefined || seen === null) { // first tick — baseline only
-          window._lastSeenWriteAt = String(d.lastWriteAt);
-          return;
-        }
-        if (String(d.lastWriteAt) !== String(seen)) {
-          window._lastSeenWriteAt = String(d.lastWriteAt);
-          _autoRefreshSync('ping-sync');           // guarded full pull + render
-        }
-      } catch (e) {
-        // v5.04: was fully silent ("next tick retries"). It still is, from
-        // the doctor's point of view — no banner, no toast, nothing shown.
-        // But this probe runs every 30s all day and is the earliest and
-        // most sensitive detector of a flaky path, so it now leaves a
-        // throttled trace. This is what will show whether the 18/08 AM
-        // reports were one bad patch of signal or a daily pattern.
-        netlogRecordThrottled('ping', {
-          action: 'ping', checkpoint: 'keepalive', code: netlogClassify(e, null),
-          errName: String(e && e.name || ''), errMsg: String(e && e.message || e),
-          attempt: 1, recovered: false
-        });
-      }
-    }
+    // ─── v5.19: ONE POLL, VISIBLE ONLY ──────────────────────────────
+    // Replaces (a) the v4.75 30s `ping` loop — whose "something changed"
+    // answer made EVERY visible device do a FULL getAll pull — and (b) the
+    // 5-min full refresh, which also ran in HIDDEN tabs (63 of the 119
+    // user-facing failures on 09-09/09-10 came from hidden tabs).
+    // Every 60s while visible, syncFromSheets() asks the server for a delta
+    // since the version this device holds: unchanged → ~100-byte reply, no
+    // render; changed → just the changed rows. A full pull happens on its
+    // own at most every 10 min (SYNC_FULL_EVERY_MS, 03_state.js) and covers
+    // the writers that bypass the journal (PhoneAdvice web app, email
+    // processor, nightly archive). Nothing runs while the tab is hidden:
+    // coming back to the foreground triggers syncWithGuardIfStale (below).
+    // Same editing-screen guards as before (_autoRefreshSync).
     setInterval(function() {
       if (document.visibilityState !== 'visible') return;
-      _pingForChanges();
-    }, 30 * 1000);
+      _autoRefreshSync('poll');
+    }, 60 * 1000);
   }
 }
 
